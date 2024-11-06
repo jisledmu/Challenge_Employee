@@ -1,9 +1,11 @@
 from fastapi import FastAPI, UploadFile, HTTPException
-from pydantic import BaseModel, field_validator, ValidationError  # Agregar ValidationError
+from pydantic import BaseModel, field_validator, ValidationError
 import pandas as pd
 import sqlite3
 import os
 import logging
+import fastavro
+from fastavro import writer
 
 app = FastAPI()
 
@@ -58,17 +60,17 @@ def create_table(conn, table_name: str):
     
     if table_name == "departments":
         create_table_query = '''CREATE TABLE IF NOT EXISTS departments (
-                                    id INTEGER,
+                                    id INTEGER PRIMARY KEY,
                                     department VARCHAR(50) NOT NULL
                                 );'''
     elif table_name == "jobs":
         create_table_query = '''CREATE TABLE IF NOT EXISTS jobs (
-                                    id INTEGER,
+                                    id INTEGER PRIMARY KEY,
                                     job VARCHAR(50) NOT NULL
                                 );'''
     elif table_name == "hired_employees":
         create_table_query = '''CREATE TABLE IF NOT EXISTS hired_employees (
-                                    id INTEGER,
+                                    id INTEGER PRIMARY KEY,
                                     name TEXT NOT NULL,
                                     datetime TEXT NOT NULL,
                                     department_id INTEGER,
@@ -91,6 +93,36 @@ def get_model_and_columns_for_table(table_name: str):
     else:
         raise ValueError(f"Unknown table name: {table_name}")
 
+# Function to create a backup of a table in AVRO format
+def backup_table_to_avro(table_name: str):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM {table_name}")
+        rows = cursor.fetchall()
+        
+        # Get column names
+        column_names = [description[0] for description in cursor.description]
+
+        # Define AVRO schema
+        schema = {
+            "type": "record",
+            "name": f"{table_name}_record",
+            "fields": [{"name": col, "type": "string"} for col in column_names]
+        }
+
+        # Prepare the data for AVRO
+        records = [{col: str(value) for col, value in zip(column_names, row)} for row in rows]
+
+        # Write to AVRO file
+        avro_file_path = f"./{table_name}_backup.avro"
+        with open(avro_file_path, "wb") as avro_file:
+            writer(avro_file, schema, records)
+
+        logging.info(f"Backup for table {table_name} created at {avro_file_path}")
+    finally:
+        conn.close()
+
 # Endpoint to upload and process CSV files
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile):
@@ -107,19 +139,20 @@ async def upload_csv(file: UploadFile):
         conn = get_connection()
         try:
             create_table(conn, table_name)  # Create the table
-            insert_data_from_csv(conn, file_path, table_name)  # Insert the data
+            insert_or_update_data_from_csv(conn, file_path, table_name)  # Insert or update the data
+            backup_table_to_avro(table_name)  # Create the backup in AVRO format
         finally:
             conn.close()
 
         # Remove the temporary file
         os.remove(file_path)
 
-        return {"message": f"Data from {file.filename} has been inserted into {table_name} table."}
+        return {"message": f"Data from {file.filename} has been inserted/updated in {table_name} table and backup created."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Function to insert data from a CSV file into the corresponding table with validation
-def insert_data_from_csv(conn, file_path: str, table_name: str):
+# Function to insert or update data from a CSV file into the corresponding table with validation
+def insert_or_update_data_from_csv(conn, file_path: str, table_name: str):
     # Read the CSV file into a DataFrame without headers (header=None)
     data = pd.read_csv(file_path, header=None)
 
@@ -129,7 +162,7 @@ def insert_data_from_csv(conn, file_path: str, table_name: str):
     # Assign the column names manually based on the table
     data.columns = columns
 
-    # Validate and insert each row
+    # Validate and process each row
     valid_rows = []
     invalid_rows = []
     for index, row in data.iterrows():
@@ -137,20 +170,25 @@ def insert_data_from_csv(conn, file_path: str, table_name: str):
             # Validate the row data with the Pydantic model
             validated_data = Model(**row.to_dict())
             valid_rows.append(validated_data.dict())
-        except ValidationError as e:  # Esta línea captura el error de validación
+        except ValidationError as e:
             # Log invalid rows
             logging.error(f"Invalid row {index} in table {table_name}: {e}")
             invalid_rows.append((index, row.to_dict()))
 
-    # Check if there are any valid rows to insert
+    # Insert or update the valid rows in the database
     if valid_rows:
-        # Insert the valid rows into the database
         cursor = conn.cursor()
         for row in valid_rows:
             columns = ", ".join(row.keys())
             placeholders = ", ".join("?" for _ in row)
+            update_placeholders = ", ".join(f"{col} = ?" for col in row.keys() if col != "id")
+
+            # Construct the SQL query to update if the primary key (id) already exists
             values = tuple(row.values())
-            cursor.execute(f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})", values)
+            cursor.execute(
+                f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(id) DO UPDATE SET {update_placeholders}", values + tuple(row.values())[1:]
+            )
         conn.commit()
 
     # If there are invalid rows, register the error in the log
