@@ -184,3 +184,4 @@ Each endpoint will be documented in Swagger. Below are some examples:
    - **Endpoint**: `GET /departments-above-average/`
    - **Description**: Displays the departments with hiring rates above the average in 2021.
    - In Swagger, click "Try it out" and send the request.
+
