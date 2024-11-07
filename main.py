@@ -443,3 +443,100 @@ def insert_or_update_data_from_csv(conn, file_path: str, table_name: str):
     # If there are invalid rows, register the error in the log
     if invalid_rows:
         logging.error(f"Failed to insert {len(invalid_rows)} rows into table {table_name}. Invalid rows: {invalid_rows}")
+
+# Endpoint 1: Empleados contratados por trabajo y departamento en 2021, divididos por trimestre
+@app.get("/employees-by-job-and-department/")
+async def get_employees_by_job_and_department():
+    query = """
+    SELECT 
+        d.department AS department_name,
+        j.job AS job_name,
+        strftime('%Y', he.datetime) AS year,
+        (CASE 
+            WHEN strftime('%m', he.datetime) BETWEEN '01' AND '03' THEN 'Q1'
+            WHEN strftime('%m', he.datetime) BETWEEN '04' AND '06' THEN 'Q2'
+            WHEN strftime('%m', he.datetime) BETWEEN '07' AND '09' THEN 'Q3'
+            ELSE 'Q4'
+        END) AS quarter,
+        COUNT(he.id) AS employees_hired
+    FROM 
+        hired_employees AS he
+    JOIN 
+        departments AS d ON he.department_id = d.id
+    JOIN 
+        jobs AS j ON he.job_id = j.id
+    WHERE 
+        strftime('%Y', he.datetime) = '2021'
+    GROUP BY 
+        d.department, j.job, quarter
+    ORDER BY 
+        d.department ASC, j.job ASC, quarter;
+    """
+    conn = get_connection()
+    try:
+        result = conn.execute(query).fetchall()
+        return [
+            {
+                "department_name": row[0],
+                "job_name": row[1],
+                "year": row[2],
+                "quarter": row[3],
+                "employees_hired": row[4]
+            }
+            for row in result
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# Endpoint 2: Departamentos con más contrataciones que el promedio de 2021
+@app.get("/departments-above-average/")
+async def get_departments_above_average():
+    query = """
+    WITH department_hiring_count AS (
+        SELECT 
+            d.id AS department_id,
+            d.department AS department_name,
+            COUNT(*) AS employees_hired
+        FROM 
+            hired_employees AS he
+        JOIN 
+            departments AS d ON he.department_id = d.id
+        WHERE 
+            strftime('%Y', he.datetime) = '2021'
+        GROUP BY 
+            d.id, d.department
+    ),
+    average_hiring AS (
+        SELECT 
+            AVG(employees_hired) AS avg_employees_hired
+        FROM 
+            department_hiring_count
+    )
+    SELECT 
+        department_hiring_count.department_id AS id,
+        department_hiring_count.department_name AS name,
+        department_hiring_count.employees_hired AS number_of_employees_hired
+    FROM 
+        department_hiring_count
+    JOIN 
+        average_hiring ON department_hiring_count.employees_hired > average_hiring.avg_employees_hired
+    ORDER BY 
+        department_hiring_count.employees_hired DESC;
+    """
+    conn = get_connection()
+    try:
+        result = conn.execute(query).fetchall()
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "number_of_employees_hired": row[2]
+            }
+            for row in result
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
